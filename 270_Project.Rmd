@@ -1,0 +1,295 @@
+---
+title: "270 Code"
+author: "Jasen"
+date: "2024-06-09"
+output: pdf_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(gridExtra)
+library(coda)
+library(reshape2)
+
+source("helper.R")
+source("Sample_mu.R")
+source("generate_data.R")
+```
+
+# Simulate data
+
+```{r}
+set.seed(270)
+
+# simulated data
+
+tmax <- 200
+a1 <- 9
+b1 <- 10
+mu1 <- 0.05
+
+a2 <- 1
+b2 <- 4
+mu2 <- 0.1
+
+# data come from two kernels
+# first one is more explosive but less frequent
+# second one is less explosive but more frequent
+
+events1 <- immigrant_children_simulation(tmax, a1, b1, mu1)
+events2 <- immigrant_children_simulation(tmax, a2, b2, mu2)
+
+g1 <- make_stepfunction(events1, tmax)
+g2 <- make_stepfunction(events2, tmax)
+
+
+events <- c(events1, events2)
+events <- sort(events)
+n_events <- length(events)
+
+g3 <- make_stepfunction(events, tmax)
+
+# first graph is from the more explosive but less frequent kernel
+# second graph is from the less explosive but more frequent kernel
+# third graph combines the two graphs above into observed data
+
+g_all_events_3 <- grid.arrange(g1, g2, g3, nrow = 3, ncol = 1)
+
+ggsave('sim_data.png', g_all_events_3, width = 8, height = 6)
+```
+
+\newpage
+
+
+# Intializing parameters
+
+
+```{r}
+
+# assumed fixed constants
+alpha <- 1
+total_clusters <- 5
+
+# starting values and memberships
+thetas  <- rep(c(1,2),500)
+thetas <- thetas[1:n_events]
+
+alphas <- rep(c(1.5, 2), 500)
+alphas <- alphas[1:n_events]
+
+betas <- rep(c(2, 5), 500)
+betas <- betas[1:n_events]
+
+mu <- 0.1
+
+
+# MCMC parameters
+niter <- 20000
+nburnin <- 500
+nthin <- 50
+
+# Matrices to store MCMC runs
+
+theta_MCMC <- matrix(0, niter, total_clusters)
+alpha_MCMC <- matrix(0, niter, total_clusters)
+beta_MCMC <- matrix(0, niter, total_clusters)
+mu_MCMC <- matrix(0, niter, 1)
+
+```
+
+# Block Gibbs
+
+```{r}
+
+for(i in 1:niter){
+
+  # STEP 1 - SAMPLE THE TREE
+  
+  tree <- sample_tree(events, mu, thetas, alphas, betas)
+
+  # STEP 2 - SAMPLE MU
+  
+  mu <- sample_mu(tree, tmax)
+  
+  # STEP 3 - SAMPLE NEW MEMBERSHIPS
+  
+  params <- neal_8(events,
+                   thetas,
+                   alphas,
+                   betas,
+                   mu, tmax, alpha,
+                   tree,
+                   total_clusters)
+  
+  
+  thetas <- params$thetas
+  alphas <- params$alphas
+  betas  <- params$betas
+  
+  # STEP 3.5 - SORT THEM
+  
+  params_temp <- data.frame(1:total_clusters)
+  
+  colnames(params_temp) <- c('thetas')
+  
+  params_distinct <- distinct(params %>% select(-events)) 
+  
+  params2 <- params_distinct %>% full_join(params_temp, by = 'thetas') %>% 
+    arrange(thetas)
+  
+
+  # STEP 4 - STORE VALUES
+  
+  mu_MCMC[i,1] <- mu
+  
+  temp_theta <- rep(1, total_clusters)
+  
+  temp_theta[! params2$thetas %in% params_distinct$thetas] <- NA
+  
+  theta_MCMC[i,] <- temp_theta
+  alpha_MCMC[i,] <- params2$alphas
+  beta_MCMC[i,] <- params2$betas
+  
+  # if(i %% 100 == 0){
+  #   print(i)
+  # }
+}
+
+```
+
+\newpage
+
+# Results
+
+## MCMC chains before thinning
+
+```{r}
+
+## Burnin
+
+theta_MCMC <- theta_MCMC[(nburnin+1):niter,]
+alpha_MCMC <- alpha_MCMC[(nburnin+1):niter,]
+beta_MCMC <- beta_MCMC[(nburnin+1):niter,]
+mu_MCMC <- mu_MCMC[(nburnin+1):niter,]
+
+
+g_mu <- ggplot() + geom_line(aes(x = (nburnin+1):niter, y = mu_MCMC)) + 
+  xlab('iter') + 
+  ylab('mu')
+
+g_alpha <- ggplot() + geom_line(aes(x = (nburnin+1):niter, y = log(alpha_MCMC[,1]))) + 
+  xlab('iter') + 
+  ylab('alpha_1')
+
+g_beta <- ggplot() + geom_line(aes(x = (nburnin+1):niter, y = log(beta_MCMC[,1]))) + 
+  xlab('iter') + 
+  ylab('beta_1')
+
+
+g_mixing <- grid.arrange(g_mu, g_alpha, g_beta, nrow = 3, ncol = 1)
+
+ggsave('DPMM_Mixing.png', g_mixing, width = 8, height = 4)
+
+```
+
+\newpage
+
+# ACF
+
+```{r}
+
+# terrible mixing
+
+acf(mu_MCMC)
+acf(alpha_MCMC[,1])
+acf(beta_MCMC[,1])
+
+```
+
+\newpage
+
+# Proportion of Iterations Clusters have Members
+
+```{r}
+100 * apply(theta_MCMC, 2, function(x){mean(! is.na(x))}) %>% 
+  round(4) 
+```
+
+
+
+\newpage
+
+## posterior densities
+
+```{r}
+g_mu_hist <- ggplot() + geom_density(aes(x = mu_MCMC)) + 
+  geom_vline(xintercept = 0.15, linetype = 'dashed', 
+             alpha = 0.4, color = 'black') +
+  xlim(0, 0.3) + 
+  xlab('mu')
+
+
+alpha_df <- data.frame(alpha_MCMC)
+alpha_df$ID <- (nburnin+1):niter 
+alpha_df_tall <- melt(alpha_df, id.vars = "ID")
+
+beta_df <- data.frame(beta_MCMC)
+beta_df$ID <- (nburnin+1):niter 
+beta_df_tall <- melt(beta_df, id.vars = "ID")
+
+g_alpha_total <- ggplot(data = alpha_df_tall) + 
+  geom_density(aes(x = value, color = variable)) + 
+  geom_vline(xintercept = 1, linetype = 'dashed', 
+             alpha = 0.4, color = 'red') + 
+  geom_vline(xintercept = 5, linetype = 'dashed', 
+             alpha = 0.4, color = 'blue') + 
+  xlim(0, 20) + 
+  labs(color = "alpha") + 
+  xlab('alpha') + 
+  theme(legend.position = "none")
+
+
+g_beta_total <- ggplot(data = beta_df_tall) + 
+  geom_density(aes(x = value, color = variable)) + 
+  geom_vline(xintercept = 4, linetype = 'dashed', 
+             alpha = 0.4, color = 'red') + 
+  geom_vline(xintercept = 10, linetype = 'dashed', 
+             alpha = 0.4, color = 'blue') +   
+  xlim(0,20) + 
+  labs(color = "beta") +
+  xlab('beta') + 
+  theme(legend.position = "none")
+
+
+
+g_all_clusters <- grid.arrange(g_mu_hist, g_alpha_total, g_beta_total, 
+                               nrow = 3, ncol = 1)
+
+
+ggsave(file="alpha_beta.png", width = 8, height = 4, g_all_clusters)
+
+```
+
+\newpage
+
+# Posterior Means
+
+## mu
+
+```{r}
+mean(mu_MCMC) %>% round(3)
+```
+
+## alpha
+
+```{r}
+apply(alpha_df %>%  select(-ID), 2, function(x){mean(x, na.rm = T)}) %>%
+  round(3)
+```
+## beta
+
+```{r}
+apply(beta_df %>%  select(-ID), 2, function(x){mean(x, na.rm = T)}) %>%
+  round(3)
+```
+

@@ -1,0 +1,272 @@
+---
+title: "270_Project_Naive"
+author: "Jasen"
+date: "2024-06-12"
+output: pdf_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(gridExtra)
+library(coda)
+library(reshape2)
+
+source("helper.R")
+source("Sample_mu.R")
+source("generate_data.R")
+```
+
+# Simulate Data
+
+```{r}
+set.seed(270)
+
+# simulated data
+
+tmax <- 200
+a1 <- 9
+b1 <- 10
+mu1 <- 0.05
+
+a2 <- 1
+b2 <- 4
+mu2 <- 0.1
+
+# data come from two kernels
+# first one is more explosive but less frequent
+# second one is less explosive but more frequent
+
+events1 <- immigrant_children_simulation(tmax, a1, b1, mu1)
+events2 <- immigrant_children_simulation(tmax, a2, b2, mu2)
+
+g1 <- make_stepfunction(events1, tmax)
+g2 <- make_stepfunction(events2, tmax)
+
+
+events <- c(events1, events2)
+events <- sort(events)
+n_events <- length(events)
+
+g3 <- make_stepfunction(events, tmax)
+
+# first graph is from the more explosive but less frequent kernel
+# second graph is from the less explosive but more frequent kernel
+# third graph combines the two graphs above into observed data
+
+g_all_events_3 <- grid.arrange(g1, g2, g3, nrow = 3, ncol = 1)
+
+ggsave('sim_data.png', g_all_events_3, width = 8, height = 6)
+```
+
+
+\newpage
+
+# Starting values
+
+```{r}
+
+
+
+
+# starting values and memberships
+
+alpha <- 1
+beta <- 2
+
+thetas  <- rep(1, n_events)
+
+alphas <- rep(alpha, n_events)
+
+betas <- rep(beta, n_events)
+
+mu <- 0.1
+
+# true values, mu = 0.05 + 0.1 = 0.15
+# (a1, b1) = (9, 10)
+# (a2, b2) = (1, 4)
+
+# MCMC parameters
+niter <- 20000
+nburnin <- 500
+nthin <- 50
+
+# Matrices to store MCMC runs
+
+MCMC_df <- matrix(0, niter, 4)
+```
+
+## likelihood
+
+```{r}
+# log priors 
+
+prior_ab <- function(log_a,log_b){
+  
+  # prior likelihoods of a and b 
+  # we want to ensure that the likelihood of a/b > 1 is impossible
+  # log(b) ~ N(0.5, 1)
+  # a ~ unif[0, b] --> likelihood is 1/b
+  
+  pb <- dnorm(log_b, mean = 0.5, sd = 1)
+  pa <- 1/exp(log_b) 
+  
+  return(log(pa) + log(pb))
+}
+
+# proposed values
+proposal <- function(log_a,log_b){
+  
+  # first propose log(b*) ~ N(log(b), 0.6)
+  # this is to ensure b is always positive
+  #
+  # then propose a = unif[0, b] 
+  # this is to to ensure that a/b < 1
+
+  proposed_log_b <- rnorm(1, mean = log_b, sd = 0.25)
+  proposed_a <- runif(1, min = 0, max = exp(proposed_log_b))
+  proposed_log_a <- log(proposed_a)
+  
+  
+  return(c(proposed_log_a, proposed_log_b))
+}
+
+```
+
+\newpage
+
+# Block Gibbs
+
+```{r}
+for(i in 1:niter){
+
+  # STEP 1 - SAMPLE THE TREE
+  
+  tree <- sample_tree(events, mu, thetas, alphas, betas)
+
+  # STEP 2 - SAMPLE MU
+  
+  mu <- sample_mu(tree, tmax)
+  
+  # STEP 3 - SAMPLE NEW ALPHA AND BETA
+  
+  proposed_values <- proposal(log(alpha), log(beta))
+  
+  log_a_star <- proposed_values[1]
+  log_b_star <- proposed_values[2]
+  
+  MCMC_ratio <- prior_ab(log_a_star, log_b_star) - 
+                prior_ab(log(alpha), log(beta)) + 
+    hawkes_likelihood_recursive(events, exp(log_a_star), exp(log_b_star), mu) -
+    hawkes_likelihood_recursive(events, alpha, beta, mu) 
+  
+  # accept or reject depending on u < MH_value
+  
+  MH_value <- min(0, MCMC_ratio)
+  log_u <- log(runif(1))
+  
+  if(log_u < MH_value){
+    alpha <- exp(log_a_star)
+    beta <- exp(log_b_star)
+  }
+  
+  MCMC_df[i,] <- c(i, mu, alpha, beta)
+  
+  alphas <- rep(alpha, n_events)
+  betas <- rep(beta, n_events)
+  
+  # if(i %% 100 == 0){
+  #   print(i)
+  # }
+}
+
+MCMC_df <- data.frame(MCMC_df)
+colnames(MCMC_df) <- c('index', 'mu', 'alpha', 'beta')
+MCMC_df_burnin <- MCMC_df[(nburnin+1):niter,]
+
+thin_index <- seq(from = 1, to = nrow(MCMC_df_burnin), by = nthin)
+MCMC_df_thin <- MCMC_df_burnin[thin_index,]
+
+MCMC_df_thin$thin_index <- 1:nrow(MCMC_df_thin)
+```
+
+\newpage
+
+
+# Results
+
+## MCMC chains before thinning
+
+```{r}
+g_alpha <- ggplot(data = MCMC_df_burnin) + geom_line(aes(x = index, y = alpha))
+g_beta <- ggplot(data = MCMC_df_burnin) + geom_line(aes(x = index, y = beta))
+g_mu <- ggplot(data = MCMC_df_burnin) + geom_line(aes(x = index, y = mu))
+
+grid.arrange(g_mu, g_alpha, g_beta, nrow = 3, ncol = 1)
+```
+
+\newpage
+
+# ACF and ESS
+
+
+```{r}
+mcmc.obj.a <- as.mcmc(MCMC_df_burnin$alpha)
+mcmc.obj.b <- as.mcmc(MCMC_df_burnin$beta)
+mcmc.obj.mu <- as.mcmc(MCMC_df_burnin$mu)
+
+ess.a <- mean(coda::effectiveSize(mcmc.obj.a))
+ess.b <- mean(coda::effectiveSize(mcmc.obj.b))
+ess.mu <- mean(coda::effectiveSize(mcmc.obj.mu))
+
+ess.mu
+ess.a
+ess.b
+```
+
+\newpage
+
+```{r}
+alpha_acf <- acf(MCMC_df_burnin$alpha)
+beta_acf <- acf(MCMC_df_burnin$beta)
+mu_acf <- acf(MCMC_df_burnin$mu)
+```
+
+\newpage
+
+# posterior mean
+
+```{r}
+apply(MCMC_df_thin %>% select(-c('index', 'thin_index')), 2, 
+      function(x){round(mean(x), 3)})
+```
+
+
+true values:
+  - mu = 0.05 + 0.1 = 0.15
+  - (a1, b1) = (1, 4)
+  - (a2, b2) = (9, 10)
+
+
+# posterior distribution
+
+```{r}
+g_mu_post <- ggplot() + geom_density(data = MCMC_df_thin, aes(x = mu)) + 
+  geom_vline(xintercept = 0.15, linetype="dashed", color = "black", alpha = 0.4) + 
+  xlim(0, 0.3)
+
+g_a_post  <- ggplot() + geom_density(data = MCMC_df_thin, aes(x = alpha)) + 
+  geom_vline(xintercept = 1, linetype="dashed", color = "red", alpha = 0.4) + 
+  geom_vline(xintercept = 9, linetype="dashed", color = "blue", alpha = 0.4) +
+  xlim(0, 15)
+
+g_b_post  <- ggplot() + geom_density(data = MCMC_df_thin, aes(x = beta)) +
+  geom_vline(xintercept = 4, linetype="dashed", color = "red", alpha = 0.4) + 
+  geom_vline(xintercept = 10, linetype="dashed", color = "blue", alpha = 0.4) +
+  xlim(0, 15)
+
+
+g_post <- grid.arrange(g_mu_post, g_a_post, g_b_post)
+
+
+ggsave('posterior_naive.png', g_post, width = 8, height = 4)
+```
